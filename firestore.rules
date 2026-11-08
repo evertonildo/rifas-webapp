@@ -1,0 +1,75 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function usuarioLogado() {
+      return request.auth != null;
+    }
+
+    function ehAdmin() {
+      return usuarioLogado()
+        && exists(/databases/$(database)/documents/usuarios/$(request.auth.uid))
+        && get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data.perfil in ['SYSOP', 'ADMIN', 'OPERATOR'];
+    }
+
+    function rifaAberta(rifaId) {
+      return exists(/databases/$(database)/documents/rifas/$(rifaId))
+        && get(/databases/$(database)/documents/rifas/$(rifaId)).data.encerrada == false;
+    }
+
+    // ===================== USUÁRIOS =====================
+    match /usuarios/{uid} {
+      allow read: if ehAdmin() || (usuarioLogado() && request.auth.uid == uid);
+      allow create: if usuarioLogado() && request.auth.uid == uid
+        && request.resource.data.perfil == 'USER';
+      allow update: if ehAdmin()
+        || (usuarioLogado() && request.auth.uid == uid
+            && request.resource.data.perfil == resource.data.perfil);
+      allow delete: if ehAdmin();
+    }
+
+    // ===================== RIFAS =====================
+    match /rifas/{rifaId} {
+      allow read: if true;
+      allow create, update, delete: if ehAdmin();
+
+      match /numeros/{numero} {
+        allow read: if true;
+        allow create, delete: if ehAdmin();
+        allow update: if ehAdmin()
+          || (rifaAberta(rifaId)
+              && resource.data.status == 'livre'
+              && request.resource.data.status == 'reservado'
+              && request.resource.data.numero == resource.data.numero);
+      }
+
+      match /reservas/{reservaId} {
+        allow read: if true;
+        allow create: if rifaAberta(rifaId)
+          && request.resource.data.status == 'reservado'
+          && request.resource.data.numeros is list
+          && request.resource.data.numeros.size() > 0
+          && request.resource.data.numeros.size() <= 100
+          && request.resource.data.participante.nome is string
+          && request.resource.data.participante.email is string
+          && request.resource.data.participante.telefone is string
+          && request.resource.data.participante.cidade is string;
+        allow update: if ehAdmin()
+          || (resource.data.status == 'reservado'
+              && request.resource.data.status == resource.data.status
+              && request.resource.data.numeros == resource.data.numeros);
+        allow delete: if ehAdmin();
+
+        match /comprovantes/{comprovanteId} {
+          allow read: if true;
+          allow create: if ehAdmin()
+            || (rifaAberta(rifaId)
+                && request.resource.data.base64 is string
+                && request.resource.data.base64.size() < 950000
+                && request.resource.data.base64.matches('data:(image|application/pdf).*'));
+          allow update, delete: if ehAdmin();
+        }
+      }
+    }
+  }
+}

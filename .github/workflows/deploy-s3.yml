@@ -1,0 +1,137 @@
+name: Deploy — S3 + CloudFront
+
+# Publica o build do Angular (dist/rifas-webapp/browser) em um bucket S3 e
+# invalida o CloudFront. As rifas encerradas/sorteadas também têm sua página
+# de compartilhamento (Open Graph) regenerada antes do upload.
+#
+# Segredos necessários (Settings → Secrets and variables → Actions):
+#   AWS_ACCESS_KEY_ID       chave IAM com permissão de s3:PutObject/DeleteObject
+#                           no bucket e cloudfront:CreateInvalidation
+#   AWS_SECRET_ACCESS_KEY   segredo da mesma chave
+#   AWS_REGION              ex.: us-east-1
+#   S3_BUCKET               ex.: rifas-audita-site
+#   CLOUDFRONT_DISTRIBUTION_ID  ex.: E1A2B3C4D5E6F7
+#   APP_BASE_URL            ex.: https://rifas.audita.app.br
+#   FIREBASE_*              credenciais do app web (usadas no build)
+#                           FIREBASE_API_KEY, FIREBASE_AUTH_DOMAIN,
+#                           FIREBASE_PROJECT_ID, FIREBASE_STORAGE_BUCKET,
+#                           FIREBASE_MESSAGING_SENDER_ID, FIREBASE_APP_ID
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-s3
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    name: Build e deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Instalar dependências
+        run: npm ci --no-audit --no-fund
+
+      - name: Gravar credenciais do Firebase no environment
+        env:
+          FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          FIREBASE_AUTH_DOMAIN: ${{ secrets.FIREBASE_AUTH_DOMAIN }}
+          FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+          FIREBASE_STORAGE_BUCKET: ${{ secrets.FIREBASE_STORAGE_BUCKET }}
+          FIREBASE_MESSAGING_SENDER_ID: ${{ secrets.FIREBASE_MESSAGING_SENDER_ID }}
+          FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
+        run: |
+          cat > src/environments/environment.prod.ts <<EOF
+          export const environment = {
+            production: true,
+            firebase: {
+              apiKey: '${FIREBASE_API_KEY}',
+              authDomain: '${FIREBASE_AUTH_DOMAIN}',
+              projectId: '${FIREBASE_PROJECT_ID}',
+              storageBucket: '${FIREBASE_STORAGE_BUCKET}',
+              messagingSenderId: '${FIREBASE_MESSAGING_SENDER_ID}',
+              appId: '${FIREBASE_APP_ID}',
+            },
+            comprovanteMaxBytes: 700 * 1024,
+            comprovanteMaxOriginalBytes: 8 * 1024 * 1024,
+          };
+          EOF
+          cp src/environments/environment.prod.ts src/environments/environment.ts
+
+      - name: Build de produção
+        run: npm run build -- --configuration production
+
+      - name: Gerar páginas de compartilhamento (Open Graph)
+        env:
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+        run: python3 scripts/gerar-og.py
+
+      # ---------- S3 ----------
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # Estáticos com hash: cache longo e imutável
+      - name: Upload dos assets (cache longo)
+        run: |
+          aws s3 sync dist/rifas-webapp/browser s3://${{ secrets.S3_BUCKET }} \
+            --delete \
+            --exclude "index.html" \
+            --exclude "sw.js" \
+            --exclude "manifest.webmanifest" \
+            --exclude "r/*" \
+            --cache-control "public, max-age=31536000, immutable"
+
+      # HTML, service worker e manifest: nunca cachear
+      - name: Upload do HTML e service worker (sem cache)
+        run: |
+          aws s3 sync dist/rifas-webapp/browser s3://${{ secrets.S3_BUCKET }} \
+            --exclude "*" \
+            --include "index.html" \
+            --include "sw.js" \
+            --include "manifest.webmanifest" \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      # Páginas /r/<id> com as metas Open Graph de cada rifa
+      - name: Upload das páginas de compartilhamento
+        run: |
+          if [ -d dist/rifas-webapp/browser/r ]; then
+            aws s3 sync dist/rifas-webapp/browser/r s3://${{ secrets.S3_BUCKET }}/r \
+              --cache-control "public, max-age=300"
+          else
+            echo "Sem páginas /r — nada a enviar."
+          fi
+
+      # ---------- CloudFront ----------
+      - name: Invalidar CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+
+      - name: Resumo
+        run: |
+          echo "### Deploy concluído 🎟️" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Site: ${{ secrets.APP_BASE_URL }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Bucket: \`${{ secrets.S3_BUCKET }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Distribuição: \`${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}\`" >> $GITHUB_STEP_SUMMARY

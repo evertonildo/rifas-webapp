@@ -1,0 +1,31 @@
+{
+  "name": "rifas-webapp",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "ng": "ng",
+    "start": "ng serve",
+    "build": "ng build",
+    "build:og": "ng build && python3 scripts/gerar-og.py",
+    "deploy": "ng build && python3 scripts/gerar-og.py && firebase deploy --only hosting,firestore:rules",
+    "deploy:s3": "ng build && python3 scripts/gerar-og.py && node scripts/deploy-s3.js",
+    "preview": "ng serve --configuration development"
+  },
+  "dependencies": {
+    "@angular/common": "^22.1.7",
+    "@angular/compiler": "^22.1.7",
+    "@angular/core": "^22.1.7",
+    "@angular/forms": "^22.1.7",
+    "@angular/platform-browser": "^22.1.7",
+    "@angular/router": "^22.1.7",
+    "firebase": "^12.19.0",
+    "rxjs": "~7.8.0",
+    "tslib": "^2.3.0"
+  },
+  "devDependencies": {
+    "@angular/build": "^22.1.8",
+    "@angular/cli": "^22.1.8",
+    "@angular/compiler-cli": "^22.1.7",
+    "typescript": "~6.0.2"
+  }
+}

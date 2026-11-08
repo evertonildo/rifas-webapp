@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+# ============================================================================
+#  Rifas Audita — S3 + CloudFront (site estático Angular)
+#
+#  Cria:
+#    - bucket S3 privado para o build
+#    - distribuição CloudFront com OAC (Origin Access Control)
+#    - função de borda que resolve rotas da SPA e as páginas /r/<id>
+#    - política de bucket que só permite leitura pelo CloudFront
+#
+#  Uso:
+#    aws cloudformation deploy \
+#      --template-file infra/s3-cloudfront.yml \
+#      --stack-name rifas-audita \
+#      --parameter-overrides Dominio=rifas.audita.app.br CertificadoArn=arn:aws:acm:us-east-1:...:certificate/... \
+#      --capabilities CAPABILITY_IAM
+#
+#  Depois do deploy, publique o site e invalide o cache:
+#    npm run deploy:s3
+# ============================================================================
+
+Parameters:
+  Dominio:
+    Type: String
+    Default: "rifas.audita.app.br"
+    Description: "Dominio publico do webapp, ex. rifas.audita.app.br"
+
+  CertificadoArn:
+    Type: String
+    Default: ""
+    Description: "ARN do certificado ACM em us-east-1. Vazio usa so o dominio cloudfront.net"
+
+  NomeBucket:
+    Type: String
+    Default: ""
+    Description: "Nome do bucket. Vazio gera um nome unico automaticamente"
+
+  PrecoClasse:
+    Type: String
+    Default: "PriceClass_100"
+    AllowedValues: ["PriceClass_100", "PriceClass_200", "PriceClass_All"]
+    Description: "PriceClass_100 cobre EUA e Europa; PriceClass_All inclui o Brasil"
+
+Conditions:
+  TemBucketFixo: !Not [!Equals [!Ref NomeBucket, '']]
+  TemCertificado: !Not [!Equals [!Ref CertificadoArn, '']]
+  TemDominioProprio: !Not [!Equals [!Ref CertificadoArn, '']]
+
+Resources:
+  # ------------------------------------------------------------------ bucket
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - TemBucketFixo
+        - !Ref NomeBucket
+        - !Sub 'rifas-audita-site-${AWS::AccountId}'
+      # CloudFront acessa por OAC: o bucket fica privado.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          # Limpa versões antigas de objetos substituídos a cada deploy.
+          - Id: expirar-versoes
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+  # ------------------------------------------------------- origin access ctrl
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-oac'
+        Description: Acesso do CloudFront ao bucket do site
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ------------------------------------------------------------- distribuição
+  Distribuicao:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'Rifas Audita — ${Dominio}'
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: !Ref PrecoClasse
+        Aliases: !If
+          - TemDominioProprio
+          - [!Ref Dominio]
+          - !Ref AWS::NoValue
+        ViewerCertificate: !If
+          - TemCertificado
+          - AcmCertificateArn: !Ref CertificadoArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: s3-origin
+            DomainName: !GetAtt Bucket.RegionalDomainName
+            OriginAccessControlId: !Ref OriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: s3-origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # CachingOptimized
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt FuncaoRotas.FunctionARN
+        CustomErrorResponses:
+          # Rota desconhecida da SPA → index.html com status 200
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
+  # --------------------------------------------------------- função de rotas
+  # Resolve, na borda, o arquivo certo para cada URL:
+  #   /rifa/<id>        → /index.html   (rota da SPA)
+  #   /r/<id>           → /r/<id>/index.html (HTML com Open Graph da rifa)
+  #   /qualquer/coisa   → /index.html   (fallback da SPA)
+  FuncaoRotas:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-rotas'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Rotas da SPA + páginas de compartilhamento
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var req = event.request;
+          var uri = req.uri;
+
+          // Página de compartilhamento da rifa (tem as metas Open Graph).
+          if (uri.indexOf('/r/') === 0) {
+            if (uri.endsWith('/')) {
+              req.uri = uri + 'index.html';
+            } else if (uri.indexOf('.') === -1) {
+              req.uri = uri + '/index.html';
+            }
+            return req;
+          }
+
+          // Arquivos com extensão são servidos direto.
+          var ultimo = uri.split('/').pop();
+          if (ultimo.indexOf('.') > -1) return req;
+
+          // Todo o resto é rota da SPA.
+          req.uri = '/index.html';
+          return req;
+        }
+
+  # ------------------------------------------------ política do bucket (OAC)
+  PoliticaBucket:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PermitirCloudFront
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${Bucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribuicao.Id}'
+
+Outputs:
+  BucketName:
+    Description: Bucket para o deploy do build
+    Value: !Ref Bucket
+
+  DistributionId:
+    Description: ID da distribuição CloudFront (para a invalidation)
+    Value: !Ref Distribuicao
+
+  UrlCloudFront:
+    Description: URL do site
+    Value: !Sub 'https://${Distribuicao.DomainName}'
+
+  UrlPublica:
+    Description: URL pública (use como APP_BASE_URL)
+    Value: !If
+      - TemDominioProprio
+      - !Sub 'https://${Dominio}'
+      - !Sub 'https://${Distribuicao.DomainName}'
